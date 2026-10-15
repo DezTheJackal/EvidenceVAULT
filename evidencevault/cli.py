@@ -5,7 +5,9 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import shutil
 import sys
+import time
 from collections import Counter
 from pathlib import Path
 
@@ -20,6 +22,128 @@ from .report import create_report
 from .vault import (
     DEFAULT_MAX_FILE_BYTES, DEFAULT_MAX_TOTAL_BYTES, check_vault, create_vault, extract_vault,
 )
+
+# --------------------------------------------------------------------------- #
+# Startup banner -- terminal-only, cyberpunk/retro-terminal vault aesthetic.
+# Printed exactly once per process: main() can recurse (guided_menu() calls
+# main() again for a dry-run preview, then again to actually run), so a plain
+# "print at the top of main()" would show it 2-3 times per wizard session.
+# The module-level _BANNER_SHOWN guard is what keeps it to a single showing
+# at actual program startup, however many times main() is re-entered after.
+# --------------------------------------------------------------------------- #
+
+_BANNER_SHOWN = False
+
+_ANSI = {
+    "reset": "\033[0m", "bold": "\033[1m", "dim": "\033[2m",
+    "green": "\033[38;5;46m", "amber": "\033[38;5;214m",
+    "cyan": "\033[38;5;51m", "magenta": "\033[38;5;201m", "grey": "\033[38;5;240m",
+}
+
+# ANSI Shadow block-font renderings of "EVIDENCE" and "VAULT", 64/41 cols wide.
+_TITLE_EVIDENCE = r"""
+███████╗██╗   ██╗██╗██████╗ ███████╗███╗   ██╗ ██████╗███████╗
+██╔════╝██║   ██║██║██╔══██╗██╔════╝████╗  ██║██╔════╝██╔════╝
+█████╗  ██║   ██║██║██║  ██║█████╗  ██╔██╗ ██║██║     █████╗
+██╔══╝  ╚██╗ ██╔╝██║██║  ██║██╔══╝  ██║╚██╗██║██║     ██╔══╝
+███████╗ ╚████╔╝ ██║██████╔╝███████╗██║ ╚████║╚██████╗███████╗
+╚══════╝  ╚═══╝  ╚═╝╚═════╝ ╚══════╝╚═╝  ╚═══╝ ╚═════╝╚══════╝
+""".strip("\n").splitlines()
+
+_TITLE_VAULT = r"""
+██╗   ██╗ █████╗ ██╗   ██╗██╗  ████████╗
+██║   ██║██╔══██╗██║   ██║██║  ╚══██╔══╝
+██║   ██║███████║██║   ██║██║     ██║
+╚██╗ ██╔╝██╔══██║██║   ██║██║     ██║
+ ╚████╔╝ ██║  ██║╚██████╔╝███████╗██║
+  ╚═══╝  ╚═╝  ╚═╝ ╚═════╝ ╚══════╝╚═╝
+""".strip("\n").splitlines()
+
+# Small radial vault-door / optic glyph shown above the title on wide terminals.
+_VAULT_EYE = [
+    "         .:▓▓▓▓▓▓▓▓▓▓:.",
+    "      .:▓▓░░░░░░░░░░░░▓▓:.",
+    "    :▓▓░░◢▓▓▓▓▓▓▓▓▓▓▓◣░░▓▓:",
+    "   ▓▓░░◢▓▓▓▓▓█▓▓█▓▓▓▓▓◣░░▓▓",
+    "   ▓▓░░▓▓▓▓█▓▓◉◉▓▓█▓▓▓▓░░▓▓",
+    "   ▓▓░░◥▓▓▓▓▓█▓▓█▓▓▓▓▓◤░░▓▓",
+    "    :▓▓░░◥▓▓▓▓▓▓▓▓▓▓▓◤░░▓▓:",
+    "      ':▓▓░░░░░░░░░░░░▓▓:'",
+    "         ':▓▓▓▓▓▓▓▓▓▓:'",
+]
+
+_BOOT_LINES = [
+    "INITIALIZING TERMINAL",
+    "CALIBRATING OPTICAL SENSOR",
+    "MOUNTING CASE MODULES",
+    "VAULT INTEGRITY: NOMINAL",
+]
+
+
+def _banner_suppressed(arguments: list[str]) -> bool:
+    if os.environ.get("NO_COLOR") is not None or os.environ.get("EVIDENCEVAULT_NO_BANNER") is not None:
+        return True
+    return any(flag in arguments for flag in ("--no-banner", "-q", "--quiet"))
+
+
+def _c(text: str, color: str, use_color: bool) -> str:
+    return _ANSI[color] + text + _ANSI["reset"] if use_color else text
+
+
+def print_banner(arguments: list[str], animate: bool = True) -> None:
+    """Show the startup banner at most once per process. Silently skipped on
+    non-TTY output, when NO_COLOR/EVIDENCEVAULT_NO_BANNER is set, or when
+    --no-banner/-q/--quiet is passed -- so piping/scripting output, and every
+    later call() once the wizard is already running, stay untouched."""
+    global _BANNER_SHOWN
+    if _BANNER_SHOWN or _banner_suppressed(arguments):
+        return
+    try:
+        if not sys.stdout.isatty():
+            return
+    except Exception:  # noqa: BLE001
+        return
+    _BANNER_SHOWN = True
+
+    if os.name == "nt":
+        os.system("")  # enable ANSI/VT100 escape processing on legacy Windows cmd.exe
+
+    use_color = os.environ.get("EVIDENCEVAULT_NO_COLOR") is None
+    width = shutil.get_terminal_size(fallback=(80, 24)).columns
+
+    try:
+        if width >= 66:
+            for line in _VAULT_EYE:
+                print(_c(line.center(width - 1), "green", use_color))
+            print()
+            for line in _TITLE_EVIDENCE:
+                print(_c(line.center(width - 1), "green", use_color))
+            for line in _TITLE_VAULT:
+                print(_c(line.center(width - 1), "amber", use_color))
+        else:
+            print(_c("[ EVIDENCEVAULT ]".center(width), "green", use_color))
+
+        rule = "═" * min(width - 1, 64)
+        print(_c(rule.center(width), "grey", use_color))
+        tagline = "RETRO-TERMINAL FORENSICS UNIT // COLLECT · VERIFY · HASH · RENAME · SORT"
+        print(_c(tagline[: width - 1].center(width - 1), "cyan", use_color))
+        print(_c(("build v" + VERSION).center(width - 1), "grey", use_color))
+        print(_c(rule.center(width), "grey", use_color))
+
+        if animate and width >= 66:
+            for line in _BOOT_LINES:
+                msg = "[ " + line
+                sys.stdout.write(_c(msg, "magenta" if use_color else "grey", use_color))
+                sys.stdout.flush()
+                for _ in range(3):
+                    time.sleep(0.03)
+                    sys.stdout.write(_c(".", "magenta", use_color))
+                    sys.stdout.flush()
+                print(_c(" OK ]", "green", use_color))
+            print(_c("[ READY. ]".center(width - 1), "amber", use_color))
+        print()
+    except Exception:  # noqa: BLE001 -- a cosmetic banner must never break the tool
+        pass
 
 
 def positive(value: str) -> int:
@@ -60,7 +184,7 @@ def build_parser() -> argparse.ArgumentParser:
         epilog="Run without a command in a terminal to open the guided menu.",
     )
     parser.add_argument("--version", action="version", version="EvidenceVault " + VERSION)
-    parser.add_argument("--no-banner", "-q", "--quiet", action="store_true", help="Keep the plain command display.")
+    parser.add_argument("--no-banner", "-q", "--quiet", action="store_true", help="Skip the startup logo. It is also skipped automatically when output is piped or redirected.")
     commands = parser.add_subparsers(dest="command")
     commands.add_parser("wizard", help="Open the guided operator menu.")
 
@@ -285,6 +409,7 @@ def run_operation(args, result: RunResult, audit) -> None:
 
 
 def main(arguments: list[str] | None = None) -> int:
+    print_banner(sys.argv[1:] if arguments is None else arguments)  # once per process; see print_banner()
     parser = build_parser()
     args = parser.parse_args(arguments)
     if not args.command:
